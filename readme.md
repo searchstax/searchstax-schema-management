@@ -189,5 +189,5 @@ PRs welcome. Please include:
 
 ## License
 
-MIT (or fill in your preferred license).
+Apache-2.0 license
 
