@@ -89,13 +89,14 @@ class FieldType:
 
     def to_replace_payload(self) -> Dict[str, Any]:
         body = {"name": self.name, "class": self.clazz}
-        if self.analyzer_index:
+        if _analyzer_has_content(self.analyzer_index):
             body["indexAnalyzer"] = self.analyzer_index.to_json()
-        if self.analyzer_query:
+        if _analyzer_has_content(self.analyzer_query):
             body["queryAnalyzer"] = self.analyzer_query.to_json()
-        for k in ("positionIncrementGap", "omitNorms"):
-            if k in self.attrs:
-                body[k] = self.attrs[k]
+        # include ALL attributes from the source (e.g., locale/strength/caseLevel)
+        for k, v in (self.attrs or {}).items():
+            # avoid clobbering name/class (we don't put them in attrs anyway)
+            body[k] = v
         return {"replace-field-type": body}
 
 
@@ -237,9 +238,9 @@ def parse_copyfield(el: ET._Element) -> CopyField:
     return CopyField(source=a["source"], dest=a["dest"], maxChars=mc)
 
 
-def _parse_single_analyzer(an_el) -> Analyzer:
+def _parse_single_analyzer(an_el) -> Optional[Analyzer]:
     if an_el is None:
-        return Analyzer()
+        return None
     cf = [parse_factory(x) for x in an_el.findall("charFilter")]
     tok_el = an_el.find("tokenizer")
     tok = parse_factory(tok_el) if tok_el is not None else None
@@ -247,8 +248,9 @@ def _parse_single_analyzer(an_el) -> Analyzer:
     return Analyzer(charfilters=cf, tokenizer=tok, filters=filts)
 
 
-def parse_analyzers(ft_el: ET._Element) -> tuple[Analyzer, Analyzer]:
-    # Prefer explicit index/query analyzers; fall back to a single <analyzer>
+def parse_analyzers(
+    ft_el: ET._Element,
+) -> tuple[Optional[Analyzer], Optional[Analyzer]]:
     idx = ft_el.xpath("analyzer[@type='index']")
     qry = ft_el.xpath("analyzer[@type='query']")
     if idx or qry:
@@ -258,6 +260,8 @@ def parse_analyzers(ft_el: ET._Element) -> tuple[Analyzer, Analyzer]:
     # single analyzer applies to both
     single = ft_el.find("analyzer")
     an = _parse_single_analyzer(single)
+    if an is None:
+        return None, None
     return an, an
 
 
@@ -486,7 +490,9 @@ def build_replace_analyzer(dr: Analyzer, tg: Analyzer) -> Optional[Analyzer]:
     return Analyzer(charfilters=new_cf, tokenizer=tg.tokenizer, filters=new_filters)
 
 
-def _analyzers_equal(a: Analyzer, b: Analyzer) -> bool:
+def _analyzers_equal(a: Optional[Analyzer], b: Optional[Analyzer]) -> bool:
+    a = a or Analyzer()
+    b = b or Analyzer()
     if (a.tokenizer is None) != (b.tokenizer is None):
         return False
     if a.tokenizer and b.tokenizer and a.tokenizer.identity() != b.tokenizer.identity():
@@ -506,6 +512,10 @@ def models_equal_fieldtype(ft_a: FieldType, ft_b: FieldType) -> bool:
     ) and _analyzers_equal(
         ft_a.analyzer_query or Analyzer(), ft_b.analyzer_query or Analyzer()
     )
+
+
+def _analyzer_has_content(an: Optional[Analyzer]) -> bool:
+    return bool(an and (an.tokenizer or an.charfilters or an.filters))
 
 
 # -----------------------------
@@ -528,7 +538,7 @@ def target_to_model(target_schema: Dict[str, Any]) -> SchemaModel:
         # Prefer explicit index/queryAnalyzer; fall back to flat analyzer if present
         def _mk_an(an):
             if not an:
-                return Analyzer()
+                return None
             cf = [
                 Factory(
                     x.get("class", ""), {k: v for k, v in x.items() if k != "class"}
@@ -549,6 +559,9 @@ def target_to_model(target_schema: Dict[str, Any]) -> SchemaModel:
                 )
                 for x in an.get("filters", [])
             ]
+            # If everything is empty, treat as None
+            if not cf and not tokf and not fil:
+                return None
             return Analyzer(cf, tokf, fil)
 
         idx_an = _mk_an(ft.get("indexAnalyzer") or ft.get("analyzer"))
@@ -626,24 +639,17 @@ def build_plan(drupal: SchemaModel, target: SchemaModel) -> Dict[str, Any]:
     for name, d_ft in drupal.fieldTypes.items():
         t_ft = target.fieldTypes.get(name)
         if not t_ft:
-            plan["create_fieldTypes"].append(
-                {
-                    "add-field-type": {
-                        "name": d_ft.name,
-                        "class": d_ft.clazz,
-                        **(
-                            {"analyzer": d_ft.analyzer_index.to_json()}
-                            if d_ft.analyzer_index
-                            else {}
-                        ),
-                        **(
-                            {"analyzer_query": d_ft.analyzer_query.to_json()}
-                            if d_ft.analyzer_query
-                            else {}
-                        ),
-                    }
-                }
-            )
+            payload = {
+                "name": d_ft.name,
+                "class": d_ft.clazz,
+            }
+            for k, v in (d_ft.attrs or {}).items():
+                payload[k] = v
+            if _analyzer_has_content(d_ft.analyzer_index):
+                payload["indexAnalyzer"] = d_ft.analyzer_index.to_json()
+            if _analyzer_has_content(d_ft.analyzer_query):
+                payload["queryAnalyzer"] = d_ft.analyzer_query.to_json()
+            plan["create_fieldTypes"].append({"add-field-type": payload})
             continue
         elif not models_equal_fieldtype(d_ft, t_ft):
             idx_merged = build_replace_analyzer(
@@ -652,6 +658,9 @@ def build_plan(drupal: SchemaModel, target: SchemaModel) -> Dict[str, Any]:
             qry_merged = build_replace_analyzer(
                 d_ft.analyzer_query or Analyzer(), t_ft.analyzer_query or Analyzer()
             )
+            # If the result has no content, set back to None so it won't be emitted
+            idx_merged = idx_merged if _analyzer_has_content(idx_merged) else None
+            qry_merged = qry_merged if _analyzer_has_content(qry_merged) else None
             if idx_merged is None or qry_merged is None:
                 plan["notes"].append(
                     f"Tokenizer mismatch for fieldType '{name}'; skipping replace. You may create a shadow type manually if desired."
