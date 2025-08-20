@@ -626,8 +626,25 @@ def build_plan(drupal: SchemaModel, target: SchemaModel) -> Dict[str, Any]:
     for name, d_ft in drupal.fieldTypes.items():
         t_ft = target.fieldTypes.get(name)
         if not t_ft:
-            # (create logic unchanged)
-            ...
+            plan["create_fieldTypes"].append(
+                {
+                    "add-field-type": {
+                        "name": d_ft.name,
+                        "class": d_ft.clazz,
+                        **(
+                            {"analyzer": d_ft.analyzer_index.to_json()}
+                            if d_ft.analyzer_index
+                            else {}
+                        ),
+                        **(
+                            {"analyzer_query": d_ft.analyzer_query.to_json()}
+                            if d_ft.analyzer_query
+                            else {}
+                        ),
+                    }
+                }
+            )
+            continue
         elif not models_equal_fieldtype(d_ft, t_ft):
             idx_merged = build_replace_analyzer(
                 d_ft.analyzer_index or Analyzer(), t_ft.analyzer_index or Analyzer()
