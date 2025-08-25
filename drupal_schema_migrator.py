@@ -411,6 +411,122 @@ class SchemaAPI:
 # Normalization & Diff helpers
 # -----------------------------
 
+# Factories that should appear at most once in a pipeline
+SINGLETON_TOKEN_FILTERS = {
+    "solr.worddelimitergraphfilterfactory",
+    "solr.lengthfilterfactory",
+    "solr.lowercasefilterfactory",
+    "solr.snowballporterfilterfactory",
+    "solr.removeduplicatestokenfilterfactory",
+    "solr.flattengraphfilterfactory",
+}
+
+SINGLETON_CHAR_FILTERS = {
+    "solr.mappingcharfilterfactory",
+    # PatternReplaceCharFilterFactory is intentionally NOT singleton
+}
+
+
+def _merge_factory_lists(
+    dr_list: list[Factory], tg_list: list[Factory], singleton_classes: set[str]
+) -> list[Factory]:
+    """
+    Merge Drupal analyzer list into Target analyzer list WITHOUT deleting or reordering target items.
+    Rules:
+      - If an IDENTICAL (class+params) factory exists in target → skip.
+      - If the CLASS is singleton and target has it → UPDATE that target instance's params to Drupal's (no insert).
+      - Otherwise → INSERT at the Drupal index (clamped to end).
+    """
+
+    def _cls(s: str) -> str:
+        return (s or "").strip().lower()
+
+    result: list[Factory] = list(tg_list)
+
+    # Build class -> indices map for target
+    class_to_indices: dict[str, list[int]] = {}
+    for idx, f in enumerate(result):
+        class_to_indices.setdefault(_cls(f.clazz), []).append(idx)
+
+    def _ids(lst: list[Factory]) -> list[tuple[str, tuple]]:
+        return [f.identity() for f in lst]
+
+    ids = _ids(result)
+
+    for i, d in enumerate(dr_list):
+        d_id = d.identity()
+        d_class = _cls(d.clazz)
+
+        # Already have exact same factory → nothing to do
+        if d_id in ids:
+            continue
+
+        # Singleton present → update params in place (keep position)
+        if (
+            d_class in singleton_classes
+            and d_class in class_to_indices
+            and class_to_indices[d_class]
+        ):
+            t_idx = class_to_indices[d_class][0]
+            # Keep original class string casing; just update params
+            result[t_idx] = Factory(clazz=result[t_idx].clazz, params=dict(d.params))
+            ids = _ids(result)
+            continue
+
+        # Else insert at Drupal's index (clamped)
+        ins_at = min(i, len(result))
+        result.insert(ins_at, d)
+
+        # Maintain maps
+        ids.insert(ins_at, d_id)
+        # shift indices >= ins_at
+        for c, idxs in class_to_indices.items():
+            class_to_indices[c] = [x + 1 if x >= ins_at else x for x in idxs]
+        class_to_indices.setdefault(d_class, []).append(ins_at)
+
+    return result
+
+
+def _dedupe_singletons_preserve_first(
+    merged: list[Factory],
+    dr_list: list[Factory],
+    singleton_classes: set[str],
+) -> list[Factory]:
+    """
+    Ensure singleton classes appear at most once.
+    - Keep the FIRST occurrence (preserves target order).
+    - If Drupal provides params for that class, APPLY Drupal's params to the first occurrence.
+    - Drop later duplicates (these would be our own inserts, not original target).
+    """
+
+    def _cls(s: str) -> str:
+        return (s or "").strip().lower()
+
+    # Map singleton class -> Drupal params (if any)
+    dr_params_by_class: dict[str, dict] = {}
+    for d in dr_list:
+        c = _cls(d.clazz)
+        if c in singleton_classes:
+            dr_params_by_class[c] = dict(d.params)
+
+    seen: set[str] = set()
+    out: list[Factory] = []
+    for f in merged:
+        c = _cls(f.clazz)
+        if c in singleton_classes:
+            if c in seen:
+                # skip duplicates
+                continue
+            seen.add(c)
+            # If Drupal has params for this singleton, apply them to the FIRST occurrence
+            if c in dr_params_by_class:
+                out.append(Factory(clazz=f.clazz, params=dr_params_by_class[c]))
+            else:
+                out.append(f)
+        else:
+            out.append(f)
+    return out
+
 
 def _analyzer_to_json(an: Analyzer) -> dict:
     return (an or Analyzer()).to_json()
@@ -476,18 +592,30 @@ def analyzer_presence(dr: Analyzer, tg: Analyzer) -> Dict[str, Any]:
 
 
 def build_replace_analyzer(dr: Analyzer, tg: Analyzer) -> Optional[Analyzer]:
-    diff = analyzer_presence(dr, tg)
-    if diff["tokenizer_mismatch"]:
+    # Tokenizer must match (we never change it)
+    if (dr.tokenizer and not tg.tokenizer) or (tg.tokenizer and not dr.tokenizer):
         return None
-    new_cf = list(tg.charfilters)
-    for idx, fac in diff["inserts"]["charFilters"]:
-        ins_at = min(idx, len(new_cf))
-        new_cf.insert(ins_at, fac)
-    new_filters = list(tg.filters)
-    for idx, fac in diff["inserts"]["filters"]:
-        ins_at = min(idx, len(new_filters))
-        new_filters.insert(ins_at, fac)
-    return Analyzer(charfilters=new_cf, tokenizer=tg.tokenizer, filters=new_filters)
+    if (
+        dr.tokenizer
+        and tg.tokenizer
+        and dr.tokenizer.identity() != tg.tokenizer.identity()
+    ):
+        return None
+
+    merged_cf = _merge_factory_lists(
+        dr.charfilters, tg.charfilters, SINGLETON_CHAR_FILTERS
+    )
+    merged_tf = _merge_factory_lists(dr.filters, tg.filters, SINGLETON_TOKEN_FILTERS)
+
+    # FINAL SAFETY: enforce singleton constraint & apply Drupal params to first occurrence
+    merged_cf = _dedupe_singletons_preserve_first(
+        merged_cf, dr.charfilters, SINGLETON_CHAR_FILTERS
+    )
+    merged_tf = _dedupe_singletons_preserve_first(
+        merged_tf, dr.filters, SINGLETON_TOKEN_FILTERS
+    )
+
+    return Analyzer(charfilters=merged_cf, tokenizer=tg.tokenizer, filters=merged_tf)
 
 
 def _analyzers_equal(a: Optional[Analyzer], b: Optional[Analyzer]) -> bool:
