@@ -419,6 +419,8 @@ SINGLETON_TOKEN_FILTERS = {
     "solr.snowballporterfilterfactory",
     "solr.removeduplicatestokenfilterfactory",
     "solr.flattengraphfilterfactory",
+    "solr.synonymgraphfilterfactory",
+    "solr.stopfilterfactory",
 }
 
 SINGLETON_CHAR_FILTERS = {
